@@ -1,0 +1,24 @@
+def extract_message_names(channel_path):
+    message_names = {}
+    Nodes = {}
+    database = {}
+    for key in channel_path:
+        file_path = channel_path[key]
+        try: 
+            database[key] = cantools.database.load_file(file_path)
+        except cantools.database.errors.Error as e:
+            messagebox.showerror("Error", str(e))
+            continue
+        # Get all the messages in the DBC file
+        messages = database[key].messages
+        
+        tx_nodes = set()
+        # Loop through all the messages and add their Tx nodes to the set
+        for message in messages:
+            ID = message.frame_id
+            message_names[ID] = message.name
+            tx_node = message.senders[0]  # The first sender is the Tx node
+            tx_nodes.add(tx_node)
+        Nodes[key] = tx_nodes
+
+    return message_names, database
