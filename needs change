@@ -1,0 +1,364 @@
+# Author: [Jay Chandrasekaran]
+# Date Created: [February, 24th 2023]
+# Description: [Asks user to choose messages to decode the .asc files to readable csv file]
+# Version: [1.2]
+# Date last Modified: [March, 1st 2023]
+import subprocess
+from tkinter import filedialog, messagebox
+import os
+import csv
+import sys
+import ast
+import can
+try:
+    import cantools
+except ModuleNotFoundError:
+    print("Installing cantools...")
+    subprocess.check_call(["pip", "install", "cantools"])
+try:
+    import tkinter as tk
+except ModuleNotFoundError:
+    print("Installing tkinter...")
+    subprocess.check_call(["pip", "install", "tk"])
+ 
+# Functions to ask user to select the log file they need
+def select_log_file():
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(initialdir="/Documents", title="Select log file",
+                                           filetypes=(("All files", ".*"), ("ASCII", ".asc"), ("BLF", ".blf")))
+    extension = os.path.splitext(file_path)[1]
+    root.destroy()
+    return file_path, extension
+
+# Function to get the selected asc channels
+def get_selected_channels():
+    selected_channels = []
+    
+    def submit_channels():
+        for i in range(1, 13):
+            if channel_vars[i].get() == 1:
+                selected_channels.append(i)
+                
+        root.destroy()
+    
+    root = tk.Tk()
+    root.title("Channel Selector")
+
+    channel_vars = {}
+    for i in range(1, 13):
+        var = tk.IntVar()
+        channel_vars[i] = var
+        c = tk.Checkbutton(root, text="Channel {}".format(i), variable=var)
+        c.pack()
+
+    submit_button = tk.Button(root, text="Submit", command=submit_channels)
+    submit_button.pack()
+
+    root.mainloop()
+    return selected_channels
+
+# Functions to ask user to select the dbc file they need
+def select_dbc_file(Selected_channels):
+    root = tk.Tk()
+    root.withdraw()
+    channel = {}
+    for num in Selected_channels: 
+            channel[num]= filedialog.askopenfilenames(initialdir="/Documents", title="channel- "+str(num),
+                                                    filetypes=(("DBC files", ".dbc"), ("all files", ".*")))
+            
+            if not channel[num]: messagebox.showerror("Error", "You didn't select dbc file, Re-run again"); sys.exit(0)
+    root.destroy()
+    return channel
+
+# Functions to ask user the path to save the csv file
+def select_output_file():
+    root = tk.Tk()
+    root.withdraw()
+    file_path = None
+    while not file_path:
+        file_path = filedialog.asksaveasfilename(initialdir="/Documents", title="Save output file as",
+                                             filetypes=(("CSV files", ".csv"), ("all files", ".*")), defaultextension=".csv")
+    root.destroy()
+    return file_path
+
+
+# Function to read asc file
+def read_asc_file(asc_file_path):
+    with open(asc_file_path, 'r') as f:
+        asc_log = f.readlines()
+    if not asc_log:
+        messagebox.showerror("Error","File is empty mate!")
+        sys.exit()
+    return asc_log
+
+
+def extract_message_names(channel_path):
+    combined_database = {}  # Create a single dictionary to store all DBC files
+    message_names = {}
+
+    for key, file_paths in channel_path.items():
+        for file_path in file_paths:
+            try:
+                if key not in combined_database:
+                    with open(file_path, 'r') as dbc_file:
+                        combined_database[key] = cantools.database.load_string(dbc_file.read())
+                else:
+                    with open(file_path, 'r') as dbc_file:
+                        combined_database[key].add_dbc_string(dbc_file.read())  # Add additional DBC files
+                messages = combined_database[key].messages
+                signal_names = []
+                for message in messages:
+                    signal = message.signals.name
+                    signal_names.append(signal)
+            except cantools.database.errors.Error as e:
+                print(f"Error loading DBC file '{file_path}': {str(e)}")
+
+    print(f"Total messages: {len(message_names)}")
+    return signal_names, combined_database
+
+def decode_blf_log(asc_converted_log, database, selected_msg, dbc_file_path):
+    final_dict= {}
+    selected_ID = {}
+    print(f"Channels: {dbc_file_path}")
+    for line in asc_converted_log:
+        line = line.strip()
+        fields = line.split()
+
+        timestamp = round(float(fields[0]),2)
+        channel = int(fields[1])
+        can_id = int(fields[2])
+        payload_data_length = int(fields[5])
+        data = ''.join(fields[6: payload_data_length + 6])
+
+        try: 
+            message = database[channel].get_message_by_frame_id(can_id)
+            message_name = message.name
+        except KeyError: 
+            message_name = can_id
+
+
+        if message_name in selected_msg:     
+            try: 
+                Msg_signal= database[channel].get_message_by_frame_id(can_id).decode(bytes.fromhex(data))
+            except ValueError: 
+                messagebox.showerror("Error couldn't Decode",timestamp, data)
+            except KeyError: 
+                Msg_signal
+            try:
+                Msg_signal = {k: v for k, v in Msg_signal.items()}
+            except TypeError:
+                continue
+            Msg_signal = {timestamp: Msg_signal}
+        
+            if timestamp in final_dict:
+                final_dict[timestamp].update(Msg_signal[timestamp])
+            else:
+                final_dict[timestamp] = Msg_signal[timestamp]
+
+    return final_dict
+
+
+def decode_asc_log(asc_log, database, selected_msg, dbc_file_path):
+    final_dict= {}
+    selected_ID = {}
+    print(f"Channels: {dbc_file_path}")
+    for line in asc_log:
+        line = line.strip()
+        fields = line.split()
+
+        # JLG CAN format-  0.001753 1  CFFF2D6x        Rx   d 8 00 00 00 01 21 08 00 00  Length = 556152 BitCount = 143 ID = 218100438x
+        if len(fields) > 14 and len(fields)<24 and 'Statistic' not in line:
+            timestamp = round(float(fields[0]),6)
+            channel = int(fields[1])
+            fields_id = fields[2].strip().split('x',1)
+            try:
+                can_id = int(fields_id[0], 16)
+            except Exception as e:
+                print(f"line {line}")
+                print(f"error {e}")
+            payload_data_length = int(fields[5])
+            data = ''.join(fields[6: payload_data_length + 6])
+
+            try: 
+                message = database[channel].get_message_by_frame_id(can_id)
+                message_name = message.name
+            except KeyError: 
+                message_name = can_id
+
+
+            if message_name in selected_msg:     
+                try: 
+                    Msg_signal= database[channel].get_message_by_frame_id(can_id).decode(bytes.fromhex(data))
+                except ValueError: 
+                    messagebox.showerror("Error couldn't Decode",timestamp, data)
+                except KeyError: 
+                    Msg_signal
+                try:
+                    Msg_signal = {k: v for k, v in Msg_signal.items()}
+                except TypeError:
+                    continue
+                Msg_signal = {timestamp: Msg_signal}
+            
+                if timestamp in final_dict:
+                    final_dict[timestamp].update(Msg_signal[timestamp])
+                else:
+                    final_dict[timestamp] = Msg_signal[timestamp]
+
+    return final_dict
+
+def blf_to_asc(blf_file):
+    asc_converted = ''
+    asc_log = []
+    with open(blf_file, 'rb') as f, open("pi5t.asc", 'w') as opf:
+        for msg in can.BLFReader(f):
+            data_str = ''.join(f'{byte:02X}' for byte in msg.data)
+            data_str =' '.join(data_str[i:i+2] for i in range(0, len(data_str),2))
+            asc_converted = f'{msg.timestamp:.6f} {msg.channel+1} {msg.arbitration_id} Rx d {msg.dlc} {data_str} Length = {msg.dlc * 8} Bitcount = {msg.dlc * 8} ID = {msg.arbitration_id}x\n'
+            opf.write(f'{msg.timestamp:.6f} {msg.channel+1} {msg.arbitration_id} Rx d {msg.dlc} {data_str} Length = {msg.dlc * 8} Bitcount = {msg.dlc * 8} ID = {msg.arbitration_id}x\n')
+            asc_log.append(asc_converted)
+    return asc_log
+
+# Function to Filter the messages
+def ask_user_for_message_selection(signal_names):
+    def on_search(*args):
+        search_text = search_var.get()
+        filter_names(search_text)
+
+    def filter_names(search_text):
+        listbox.delete(0, tk.END)
+        sorted_data = sorted(signal_names)
+        for signal in sorted_data:
+            if search_text.lower() in signal.lower():
+                listbox.insert(tk.END, value)
+        
+        # Preserve the selected names when the search text changes
+        selected_indices = listbox.curselection()
+        for idx in selected_indices:
+            listbox.selection_set(idx)
+
+    def get_selected_names():
+        return [listbox.get(idx) for idx in listbox.curselection()]
+
+    def select_all():
+        listbox.select_set(0, tk.END)
+        selected_names.set(get_selected_names())
+
+    def clear_all():
+        listbox.selection_clear(0, tk.END)
+        selected_names.set([])
+
+    def submit():
+        selected_names.set(get_selected_names())
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("Select Names")
+    root.geometry("300x400")
+
+    selected_names = tk.StringVar()
+
+    # search bar
+    search_label = tk.Label(root, text="Search:")
+    search_label.pack(side=tk.TOP, anchor=tk.W)
+
+    search_var = tk.StringVar()
+    search_var.trace("w", on_search)
+    search_entry = tk.Entry(root, textvariable=search_var)
+    search_entry.pack(side=tk.TOP, fill=tk.X, padx=10)
+
+    # checkbox list
+    scrollbar = tk.Scrollbar(root)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    listbox = tk.Listbox(root, yscrollcommand=scrollbar.set, selectmode=tk.MULTIPLE)
+    for signal in signal_names:
+        listbox.insert(tk.END, signal)
+    listbox.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    scrollbar.config(command=listbox.yview)
+
+    # buttons
+    select_all_button = tk.Button(root, text="Select All", command=select_all)
+    select_all_button.pack(side=tk.LEFT, padx=10, pady=10)
+
+    clear_all_button = tk.Button(root, text="Clear All", command=clear_all)
+    clear_all_button.pack(side=tk.LEFT, padx=10, pady=10)
+
+    submit_button = tk.Button(root, text="Submit", command=submit)
+    submit_button.pack(side=tk.RIGHT, padx=10, pady=10)
+
+    root.mainloop()
+
+    return ast.literal_eval(selected_names.get())
+
+# Function to sync timestamp and write the signals into csv file
+def write_to_csv(signals, file_path):
+    all_signals = set()
+
+    for signal_data in signals.values():
+        all_signals.update(signal_data.keys())
+    headers = ['timestamp', *all_signals]
+
+    with open(file_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+
+        # Initialize the previous row value
+        prev_row = [''] * len(headers)
+
+        for timestamp, signal_data in signals.items():
+            row = [timestamp] + [signal_data.get(h, '') for h in headers[1:]]
+
+            # Replace empty values in current row with previous row values
+            for i, val in enumerate(row):
+                if not val:
+                    row[i] = prev_row[i]
+
+            writer.writerow(row)
+
+            # Store the current row as the previous row for the next iteration
+            prev_row = row
+
+# Function to decide which log to be used for decoding
+def decode_log(file_path, extension):
+    
+    selected_msg = None
+    Selected_channel = get_selected_channels()
+    
+    # Map the channels and dbc file
+    dbc_file_path = select_dbc_file(Selected_channel)
+
+    # Retreive all the messages 
+    signal_names, database = extract_message_names(dbc_file_path)
+    
+    while not selected_msg:
+        # Choose messages to decode
+        selected_msg = ask_user_for_message_selection(signal_names)
+
+    if extension == '.asc': 
+        asc_log = read_asc_file(file_path)
+        final_dict = decode_asc_log(asc_log, database, selected_msg, dbc_file_path)
+    elif extension == '.blf':
+        asc_converted_log = blf_to_asc(file_path)
+        final_dict = decode_blf_log(asc_converted_log, database, selected_msg, dbc_file_path)
+    else :
+        messagebox.showerror("Error","I only accept .asc or .blf for now")
+        sys.exit(0)
+
+    # Choose output path
+    output_file_path = select_output_file() 
+
+    # Write files in the csv path     
+    write_to_csv(final_dict, output_file_path)
+    messagebox.showinfo("Success! File ready",output_file_path)
+    
+def main():
+    log_file_path = None
+    while not log_file_path:
+        log_file_path, extension = select_log_file()
+    decode_log(log_file_path, extension)
+    sys.exit()
+    
+if __name__ == '__main__':
+    main()
